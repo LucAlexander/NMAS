@@ -5,6 +5,8 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Softmax, Embedding
 from typing import Tuple, List, Callable, Union
 from time import time
+import os
+from multiprocessing import Process
 
 MERGE_TOKEN = "###"
 MAX_LAYERS = 24
@@ -238,6 +240,7 @@ def run(
             branches = list()
             while determine_branch():
                 branches.append(do_branch(branch+1))
+            dangling.append(id)
             segment = diverge(uid(), branches)
             uids.append(id)
         if decision == 2: # convergence
@@ -271,7 +274,6 @@ def run(
                         activation_func=determine_activation(),
                         loss_func=determine_loss()
                     )
-                dangling.append(id)
                 break
             temp, maybe = determine_node(branch)
             segment += temp
@@ -293,18 +295,58 @@ def run(
                 return generate_mdl(header)
             mdl = mdl.replace(MERGE_TOKEN, determine_merger(), 1)
         return f"{header}\n{mdl}\n"
-    return generate_mdl
+
+    optimizer = tf.keras.optimizers.Adam()
+
+    def tune_model(error: float, tape) -> None:
+        nonlocal optimizer
+        nonlocal main_model
+        nonlocal merge_selector
+        nonlocal submodels
+        reward = -error
+        loss = #TODO
+        def tune(sequence_model: tf.keras.Model) -> None:
+            optimizer.apply_gradients(zip(
+                tape.gradient(loss, sequence_model.trainable_variables),
+                sequence_model.trainable_variables
+            ))
+        tune(main_model)
+        tune(merge_selector)
+        [tune(sub) for _, sub in submodels.items()]
+
+    return generate_mdl, tune_model
+
+def explore(input_tensor, expected_tensor):
+    pid = os.getpid()
+    print(pid)
+    mdl, tune = run(64, 256, probabilistic, (256, 4), pid)
+    header = "/xavier,zero/"
+
+    for i in range(100):
+        with tf.GradientTape() as tape:
+            description = mdl(header)
+        tree = nm.compile(description, 4, 0.001)
+        if tree == 0:
+            tune(-100000, tape)
+            continue
+        candidate = nm.build(tree)
+        print(f"built\n{description}\n")
+        err = nm.train(model, input_tensor, expected_tensor, 2)
+        nm.release(candidate)
+        tune(err, tape)
 
 def main():
     start = int(time())
-    nm.seed(start)
-    mdl = [run(64, 256, probabilistic, (256, 4), start+ind) for ind in range(8)]
-    description = [f("/xavier,const_uneven 0.1 0.2/") for f in mdl]
-    print("\033[1;36m","\n\n".join(description),"\033[0m")
-    candidate = [nm.build(nm.compile(d, 4, 0.001)) for d in description]
-    print("compiled and build successfully")
-    [nm.release(c) for c in candidate]
-    print("memory freed")
+    nm.seed(int(time()))
+    agents = 4
+    input = []
+    expected = []
+    pids = [
+        Process(target=explore, args=(input, expected))
+        for p in range(agents)
+    ]
+    [pid.start() for pid in pids]
+    [pid.join() for pid in pids]
 
 if __name__=='__main__':
     main()
