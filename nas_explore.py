@@ -6,7 +6,7 @@ from tensorflow.keras.layers import LSTM, Dense, Softmax, Embedding
 from typing import Tuple, List, Callable, Union
 from time import time
 import os
-from multiprocessing import Process
+import random
 
 MERGE_TOKEN = "###"
 MAX_LAYERS = 24
@@ -71,14 +71,14 @@ def run(
     embedding_dimension: int,
     unit_width: int,
     strategy: Callable[[np.ndarray], int],
-    model_shape: Tuple[int, int],
-    pid: int
+    model_shape: Tuple[int, int]
 ) -> Callable[[str], str]:
-    tf.random.set_seed(pid)
+    tf.random.set_seed(int(time()))
 
     input_width, output_width = model_shape
 
     decision = 0
+    trace = list()
     units = 0
 
     def token(sub: tf.keras.Model) -> int:
@@ -91,12 +91,13 @@ def run(
             context_vector.flatten(),
             decision_vector.flatten()
         ]).reshape(1, 1, -1)
-        c = strategy(
-            np.array(model_predict(
-                sub,
-                tf.convert_to_tensor(combined_input, dtype=tf.float32)
-            )).flatten()
+        prediction = model_predict(
+            sub,
+            tf.convert_to_tensor(combined_input, dtype=tf.float32)
         )
+        probs = np.array(prediction).flatten()
+        c = strategy(probs)
+        trace.append(probs[c])
         sub.reset_states()
         return c
 
@@ -114,7 +115,11 @@ def run(
         model.add(Dense(vocab_size, activation='softmax'))
         return model
 
-    def mainmodel(embedding_dim: int, rnn_units: int, max_vocab_size: int) -> tf.keras.Model:
+    def mainmodel(
+        embedding_dim: int,
+        rnn_units: int,
+        max_vocab_size: int
+    ) -> tf.keras.Model:
         model = Sequential()
         model.add(Embedding(
             input_dim=max_vocab_size+1,
@@ -185,6 +190,7 @@ def run(
 
     def determine_merger() -> str:
         nonlocal dangling
+        nonlocal trace
         if len(dangling) > 0:
             end = dangling[0]
             del dangling[0]
@@ -204,7 +210,9 @@ def run(
             axis=1,
             keepdims=True
         )
-        return uids[np.argmax(normalized_predictions, axis=1)[0]]
+        c = np.argmax(normalized_predictions, axis=1)[0]
+        trace.append(normalized_predictions[0,c])
+        return uids[c]
 
     def determine_convergence() -> str:
         nonlocal decision
@@ -228,6 +236,7 @@ def run(
         nonlocal decision
         nonlocal uids
         nonlocal dangling
+        nonlocal id
         decision = token(submodels["layer"])
         segment = ""
         if decision == 0: # layer
@@ -244,11 +253,13 @@ def run(
             segment = diverge(uid(), branches)
             uids.append(id)
         if decision == 2: # convergence
+            last_id = id
             segment = converge(
                 uid(),
                 MERGE_TOKEN,
                 determine_convergence()
             )
+            id = last_id
         if decision == 3: # output
             if branch:
                 dangling.append(id)
@@ -281,12 +292,19 @@ def run(
 
     def generate_mdl(header: str) -> str:
         nonlocal units
+        nonlocal trace
+        nonlocal uids
+        nonlocal dangling
+        nonlocal id
+        nonlocal main_model
+        nonlocal submodels
         main_model.reset_states()
         for _, sub in submodels.items():
             sub.reset_states()
         decision = 0
         units = determine_size()
         uids.clear()
+        trace.clear()
         dangling.clear()
         id = ""
         mdl = f"(input, {input_width})\n"+do_branch(0)
@@ -303,8 +321,10 @@ def run(
         nonlocal main_model
         nonlocal merge_selector
         nonlocal submodels
+        nonlocal trace
         reward = -error
-        loss = #TODO
+        loss = -sum(map(tf.math.log, trace)) * reward
+        trace.clear()
         def tune(sequence_model: tf.keras.Model) -> None:
             optimizer.apply_gradients(zip(
                 tape.gradient(loss, sequence_model.trainable_variables),
@@ -316,37 +336,42 @@ def run(
 
     return generate_mdl, tune_model
 
-def explore(input_tensor, expected_tensor):
-    pid = os.getpid()
-    print(pid)
-    mdl, tune = run(64, 256, probabilistic, (256, 4), pid)
+def explore(input_tensor, expected_tensor, epochs):
+    target_shape = (len(input_tensor[0][0]), len(expected_tensor[0][0]))
+    mdl, tune = run(64, 256, probabilistic, target_shape)
     header = "/xavier,zero/"
-
     for i in range(100):
         with tf.GradientTape() as tape:
             description = mdl(header)
-        tree = nm.compile(description, 4, 0.001)
-        if tree == 0:
-            tune(-100000, tape)
-            continue
-        candidate = nm.build(tree)
-        print(f"built\n{description}\n")
-        err = nm.train(model, input_tensor, expected_tensor, 2)
-        nm.release(candidate)
-        tune(err, tape)
+            tree = nm.compile(description, len(input_tensor[0]), 0.001)
+            if tree == 0:
+                tune(-100000, tape)
+                continue
+            candidate = nm.build(tree)
+            print(f"built\n{description}\n")
+            err = min([
+                nm.train(candidate, input_tensor, expected_tensor, 2)
+                for _ in range(epochs)
+            ])
+            print(f"err: {err}")
+            nm.release(candidate)
+            tune(err, tape)
 
 def main():
-    start = int(time())
     nm.seed(int(time()))
-    agents = 4
-    input = []
-    expected = []
-    pids = [
-        Process(target=explore, args=(input, expected))
-        for p in range(agents)
-    ]
-    [pid.start() for pid in pids]
-    [pid.join() for pid in pids]
+    generate_tensor = (lambda vector_size, batches, samples: [
+            [
+                [random.random() for i in range(vector_size)]
+                for batch in range(batches)
+            ]
+            for k in range(samples)
+        ]
+    )
+    sample_count = 1000
+    batch_size = 32
+    input = generate_tensor(256, batch_size, sample_count)
+    expected = generate_tensor(4, batch_size, sample_count)
+    explore(input, expected, 5)
 
 if __name__=='__main__':
     main()
